@@ -1,6 +1,6 @@
 # Knowledge Integrity Engine
 
-A production-grade Retrieval-Augmented Generation system that sits between Organizations knowledge base and its autonomous AI agents—verifying, cross-examining, and freshness-tracking organizational knowledge before any agent relies on it.
+An evidence-grounded Retrieval-Augmented Generation system that sits between Organizations knowledge base and its autonomous AI agents—verifying, cross-examining, and freshness-tracking organizational knowledge before any agent relies on it.
 
 ---
 
