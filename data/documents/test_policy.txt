@@ -1,0 +1,11 @@
+ Knowledge Integrity Policy
+
+All internal engineering documentation must have a clear owner.
+
+Important technical decisions should include their source and date.
+
+Outdated information must be identified before it is used to answer a question.
+
+Document review frequency: every 90 days.
+
+the employee should be assigned only 25 holidays in this organization.

@@ -1,0 +1,18 @@
+# Python / Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+backend/venv/
+
+# Environment Variables & Secrets
+.env
+
+# Node.js / Frontend Dependencies
+frontend/node_modules/
+frontend/dist/
+
+# OS / IDE specific
+.DS_Store
+Thumbs.db
+.vscode/
