@@ -1,346 +1,287 @@
 # Knowledge Integrity Engine
 
-An evidence-grounded Retrieval-Augmented Generation system that sits between Organizations knowledge base and its autonomous AI agents—verifying, cross-examining, and freshness-tracking organizational knowledge before any agent relies on it.
+### RAG retrieves relevant information. This system asks whether that evidence actually supports the answer.
+
+Most RAG systems stop at retrieval: find something semantically close to the question, hand it to an LLM, and trust that "relevant" means "sufficient." The Knowledge Integrity Engine addresses this gap by introducing an explicit verification stage — a step that evaluates whether the evidence it retrieved is actually strong enough to support the answer, and reports that assessment alongside the answer itself.
+
+The distinction that matters:
+
+- **Relevance** — is this piece of evidence topically related to the question?
+- **Support** — does this evidence actually contain what's needed to answer the question?
+
+A retriever can find something relevant without it being supportive. This project treats that gap as the interesting engineering problem, not an acceptable side effect of RAG.
+
+To be precise about scope: this system does not verify absolute truth, does not eliminate hallucinations, and does not independently fact-check the underlying source documents. It evaluates whether the retrieved organizational evidence sufficiently supports a specific answer, using a defined set of heuristics — and it gates the response accordingly.
 
 ---
 
-## 1. Overview
+## RAG Finds Relevance. This System Checks Support.
 
-As organizations deploy autonomous AI agents across hundreds of internal systems, **retrieval alone is no longer enough**. An agent can easily retrieve information that is semantically relevant but outdated, conflicting, or entirely unsupported. 
+Standard RAG pipeline:
 
-The **Knowledge Integrity Engine** sits precisely **between your company's knowledge base and your AI agents**. Instead of letting agents or users consume raw vector search results blindly, this system inserts an explicit verification and conflict-detection layer. It treats any retrieved text as a hypothesis, checks it against strict rules, evaluates source freshness, and ensures that decisions are grounded strictly in verifiable evidence before execution.
+```
+Question → Retrieval → Context → LLM → Answer
+```
 
-Ordinary LLM question-answering is risky for internal knowledge use cases: a model can produce a fluent, confident-sounding answer that is only loosely connected to — or entirely unsupported by — the actual source documents. For policies, engineering docs, and operational procedures, that kind of unsupported answer can be actively harmful.
+Knowledge Integrity Engine pipeline:
 
-This system attempts to reduce that risk by requiring that:
-1. Evidence is retrieved for the question,
-2. Factual claims are extracted from that evidence,
-3. Those claims are checked against the question, and
-4. Only evidence that passes verification and a confidence threshold is used to produce a "verified" answer — otherwise the system falls back to a safe, unverified response rather than fabricating one.
+```
+Question → Retrieval → Candidate Evidence → Evidence Analysis →
+Support Scoring → Verification → Response
+```
 
-This does **not** eliminate hallucination. It reduces the chance of an *unsupported* answer being presented as verified, by making "was this actually backed by evidence" an explicit, checked step rather than an implicit assumption.
+- **Retrieval** asks: *"Can I find something relevant to this question?"*
+- **Verification** asks: *"Does what I found actually support the answer I'm about to give?"*
 
----
-
-## 2. Problem Statement
-
-Organizations maintain policies, engineering documentation, operational procedures, and other internal knowledge that can be outdated, ambiguous, or scattered across many documents.
-
-A standard RAG (Retrieval-Augmented Generation) chatbot retrieves relevant text and passes it to an LLM, but the LLM can still generate an answer that isn't explicitly supported by that retrieved text — it may extrapolate, blend information incorrectly, or answer confidently even when the evidence is thin or missing.
-
-The Knowledge Integrity Engine addresses this by introducing an explicit **verification stage** between retrieval and answer generation: retrieved evidence must be checked against the question before it is allowed to produce a "verified" answer, and the system is designed to fall back safely when it cannot verify.
+The project is built around making that second question explicit, measurable, and visible to the user — rather than leaving it implicit inside an LLM's fluent-sounding output.
 
 ---
 
-## 3. Core Idea
+## The Problem: Relevant Does Not Mean Supported
+
+Internal organizational knowledge — policies, engineering docs, operational procedures — is exactly the kind of content where this gap shows up. A vector search can surface a chunk that's *about* the right topic without containing the specific fact the question is asking for. A standard RAG pipeline will still pass that chunk to an LLM and get a confident, fluent answer out of it regardless of whether the evidence actually backs it up.
+
+The Knowledge Integrity Engine addresses this gap by introducing an explicit verification stage that evaluates the evidence returned by retrieval before an answer is presented.
+---
+
+## Core Workflow
 
 ```mermaid
-flowchart TD
-    A[Question] --> B[Hybrid Retrieval]
-    B --> C[Candidate Evidence]
-    C --> D[Claim Extraction]
-    D --> E[Verification]
-    E --> F[Confidence / Conflict Checks]
-    F --> G[Threshold Gating]
-    G --> H[Verified Answer]
-    G --> I[Unverified Fallback]
+flowchart LR
+    Q[Question] --> R[Retrieval]
+    R --> CE[Candidate Evidence]
+    CE --> EA[Evidence Analysis]
+    EA --> SS[Support Scoring]
+    SS --> V[Verification]
+    V --> RESP[Response: Answer + Evidence + Verification Info]
+```
+
+**Normal RAG, for comparison:**
+
+```mermaid
+flowchart LR
+    Q2[Question] --> R2[Retrieval]
+    R2 --> C2[Context]
+    C2 --> L2[LLM]
+    L2 --> A2[Answer]
 ```
 
 ---
 
-## 4. Architecture
+## System Architecture
 
-### Online query path
+```mermaid
+flowchart TB
+    subgraph Offline["Offline: Ingestion"]
+        DOC[Documents] --> ING[Ingestion]
+        ING --> CH[Chunking]
+        CH --> EMB[Local Embeddings\nall-MiniLM-L6-v2]
+        EMB --> QD[(Qdrant)]
+    end
+
+    subgraph Online["Online: Query"]
+        UI[React / Vite] --> API[FastAPI]
+        API --> LG[LangGraph Workflow]
+        LG --> RET[Retrieval]
+        RET --> QD
+        RET --> EA[Evidence Analysis]
+        EA --> VER[Verification]
+        VER --> LLM[Groq LLM]
+        LLM --> RESP[Response]
+        RESP --> UI
+    end
+
+    classDef node fill:none,stroke:#333,stroke-width:1px,color:#333;
+    class DOC,ING,CH,EMB,QD,UI,API,LG,RET,EA,VER,LLM,RESP node;
+    style Offline fill:none,stroke:#666,stroke-width:1px
+    style Online fill:none,stroke:#666,stroke-width:1px
+```
+
+LangGraph is the workflow orchestration layer for the multi-step pipeline: it coordinates the sequence from retrieval, to evidence analysis, to verification, to response generation. `test_graph.py` invokes the compiled graph directly with `knowledge_graph.invoke({"question": question})`, confirming LangGraph drives the query path. The internal node/edge structure beyond this conceptual sequence is not detailed here.
+
+Note: conflict detection is intentionally **not** shown as an active node in this diagram — see Limitations.
+
+---
+
+## What Happens During a Query
+
+1. The frontend sends the question to `POST /ask`.
+2. LangGraph starts the workflow and invokes retrieval.
+3. Candidate evidence is retrieved from Qdrant and subsequently evaluated using semantic similarity and lexical/question-term signals.
+4. The verification stage determines the question type (numeric, frequency, who, when, where, or general), extracts meaningful terms from the question, filters out stop words, and expands relevant terms using synonym groups.
+5. Retrieved evidence is split into sentences, and those sentences are evaluated as candidate supporting claims — this is sentence-level evidence analysis, not LLM-based structured claim extraction.
+6. A heuristic support score is calculated per candidate claim from semantic similarity and lexical overlap.
+7. The verification logic evaluates whether the question is sufficiently supported and determines a verification status.
+8. Groq's LLM is used for response formulation, while the evidence-support verification logic is implemented separately and independently determines the verification outcome.
+9. The API returns the answer together with verification information, evidence, confidence/support information, and warnings.
+
+---
+
+## How Does an Answer Earn "Verified"?
+
+The verification stage is the technical core of this project. It evaluates the evidence returned by retrieval using separate verification logic and determines whether that evidence sufficiently supports the answer.
+
+**Question-type detection** — *"What kind of evidence does this question require?"*
+The implementation classifies questions into types: numeric, frequency, who, when, where, or general. This affects how evidence filtering behaves — a numeric question looks for evidence containing numeric information, a "who" question looks for ownership/responsibility language, and so on. The exact filtering behavior depends on which question type is detected, not on a single fixed rule.
+
+**Term extraction and normalization** — text is normalized and tokenized into meaningful terms, stop words are removed so generic function words don't inflate lexical overlap, and relevant terms are expanded using synonym groups to catch evidence phrased differently than the question.
+
+**Sentence-level evidence analysis** — *"Does the evidence contain terms relevant to what was actually asked?"*
+Retrieved evidence is split into sentences, and those sentences are evaluated as candidate claims. This is sentence-level claim extraction/filtering, not sophisticated LLM-based structured claim decomposition — no model is generating claims here.
+
+**Semantic similarity** — *"Is this evidence semantically related?"* Calculated using the embedding representations of the question and the evidence.
+
+**Lexical overlap** — *"Does the evidence contain the specific terms the question actually needs?"* This is what catches cases where something is topically related but doesn't actually contain the requested fact.
+
+**Support scoring** — *"How strongly does the evidence support the question according to the implemented heuristics?"*
+
+```
+support_score = (similarity_score * 0.60) + (lexical_score * 0.40)
+```
+
+This is a **heuristic evidence-support score**, not a probability of correctness. A support score of 0.91 does not mean the answer has a 91% probability of being correct — it means the evidence scored highly under the implemented semantic-similarity and lexical-overlap heuristics for that specific question.
+
+**Thresholding** — *"Is the available evidence strong enough to classify the result as verified?"*
+The implementation defines:
+
+```
+MIN_SIMILARITY_SCORE = 0.25
+MIN_LEXICAL_SCORE    = 0.10
+MIN_SUPPORT_SCORE    = 0.15
+```
+
+These thresholds are used as part of evidence filtering and support evaluation, in combination with the detected question type and the support checks the verification logic performs. They are not simply three independent AND conditions that a claim must satisfy — the exact filtering behavior depends on question type as well.
+
+---
+
+## Verification Decision Flow
 
 ```mermaid
 flowchart TD
-   UI[React / Vite Frontend] --> API[FastAPI: POST /ask]
-    API --> GRAPH[LangGraph Workflow]
-    GRAPH --> RET[Hybrid Retrieval]
-    RET --> QD[(Qdrant Vector DB)]
-    QD --> RET
-    RET --> CE[Claim Extraction]
-    CE --> VER[Verification Engine]
-    VER --> LLM[Groq LLM + Scoring]
-    LLM --> GATE[Threshold Gating]
-    GATE --> RESP[Verified Answer / Fallback]
-    RESP --> UI
+    Q[Question] --> QT[Question Type Detection]
+    QT --> EA[Evidence Analysis]
+    EA --> SIM[Semantic Similarity]
+    EA --> LEX[Lexical Overlap]
+    SIM --> SUP[Support Score]
+    LEX --> SUP
+    SUP --> DEC{Verification Decision}
+    DEC --> VER[verified]
+    DEC --> NR[needs_review]
+    DEC --> UN[unverified]
 ```
 
-### Offline ingestion path
+## Verification Outcomes
 
-```mermaid
-flowchart TD
-    DOC[Source Documents] --> CHUNK[Atomic Chunking]
-    CHUNK --> FRESH[Freshness Extraction\nupdated_at]
-    FRESH --> EMB[Local Embeddings\nall-MiniLM-L6-v2]
-    EMB --> QDRANT[(Qdrant Vector Database)]
-```
+The verification logic produces one of three states:
 
-### Component summary
-
-| Component | Role |
+| Status | Meaning |
 |---|---|
-| **React / Vite frontend** | User-facing dashboard: submits questions, renders verification status, confidence, claims, evidence, and freshness info |
-| **FastAPI backend** | Exposes the HTTP API (`/`, `/health`, `/ask`) |
-| **LangGraph** | Orchestrates the multi-step query workflow (retrieval → claim extraction → verification → gating) |
-| **Qdrant** | Vector database storing chunk embeddings for retrieval |
-| **Hugging Face embeddings (`all-MiniLM-L6-v2`)** | Generates dense vector representations of chunks and questions locally |
-| **Hybrid retrieval** | Combines semantic (embedding) similarity with lexical matching to find candidate evidence |
-| **Claim extraction** | Derives discrete factual statements from retrieved evidence |
-| **Verification engine** | Checks whether extracted claims actually support the question |
-| **Groq LLM** | Used within the verification/answer-formulation steps |
-| **Threshold gating** | Decides whether confidence is high enough to return a verified answer |
+| `verified` | The available evidence sufficiently supports the question according to the implemented verification heuristics. |
+| `needs_review` | Evidence exists, but the support score is below the required confidence level. |
+| `unverified` | The available evidence does not sufficiently support the question, or no supporting claims were found. |
 
----
-### **Working Demo
+These are **system verification outcomes based on defined heuristics** — not absolute truth labels. Confidence is calculated from the strongest support score found among evaluated claims, and represents evidence-support confidence, not a probability of factual correctness.
 
-
-<img width="1905" height="884" alt="image" src="https://github.com/user-attachments/assets/6003da5f-4298-4ff9-84a7-a3a1835452c2" />
-
-<img width="1893" height="788" alt="image" src="https://github.com/user-attachments/assets/b541ac42-0cf9-4538-9aca-0d8ff3564ab4" />
-
-<img width="1888" height="884" alt="image" src="https://github.com/user-attachments/assets/8d5653f3-5166-4ff0-b9fa-c2938632174e" />
-
-<img width="1896" height="863" alt="image" src="https://github.com/user-attachments/assets/5992f2dc-5141-4c10-95cc-e37d89b55cfc" />
-
-
-
-
-
-
+Guiding design principle: when supporting evidence is insufficient, the system avoids presenting the response as a verified answer — it marks the result as unverified rather than presenting unsupported information as verified.
 
 ---
 
-## 5. How It Works
+## Freshness / Source Metadata
 
-### Phase 1 — Offline Data Ingestion
+Each indexed chunk stores metadata including its source and an `updated_at` timestamp, which is displayed alongside the retrieved evidence.
 
-1. **Source document** — a document (e.g. a policy file) is loaded from the document store.
-2. **Atomic chunking** — the document is split into small, self-contained chunks rather than large blocks, so each chunk represents one discrete piece of knowledge.
-3. **Freshness extraction** — each chunk is tagged with an `updated_at` timestamp derived from its source document.
-4. **Embedding generation** — each chunk is embedded locally using the `all-MiniLM-L6-v2` sentence-transformer model.
-5. **Qdrant storage** — the chunk (text + metadata + embedding) is stored in the Qdrant vector database.
-
-**Example:**
-
-Given the source text:
-
-> "Employees are assigned only 25 holidays in this organization."
-
-This becomes a stored chunk with associated metadata, for example:
-
-```json
-{
-  "text": "Employees are assigned only 25 holidays in this organization.",
-  "source": "hr_policy.txt",
-  "chunk_id": "chunk_014",
-  "updated_at": "2026-08-31T18:06:34"
-}
-```
-
-> **Note:** the exact metadata field names above illustrate the pattern described in the project spec. Confirm the literal field names against `chunking.py` / `ingestion.py` / `qdrant.py` before publishing, in case the implementation uses different key names.
-
-### Phase 2 — Online Query & Verification
-
-1. User submits a question in the React UI.
-2. The frontend sends the question to the FastAPI `POST /ask` endpoint.
-3. FastAPI invokes the LangGraph workflow.
-4. **Retrieval** finds candidate evidence chunks from Qdrant using hybrid (semantic + lexical) matching.
-5. **Claim extraction** pulls factual statements out of the retrieved evidence.
-6. **Verification** checks whether the extracted claims actually support/answer the question.
-7. A **confidence score** is calculated for the verification result.
-8. The system checks for **conflicts** between pieces of evidence.
-9. **Threshold gating** decides whether the confidence/verification result is strong enough to be returned as a verified answer.
-10. The final result — including answer, verification status, confidence, claims, and evidence — is returned to the React frontend.
-11. The UI renders verification status, confidence, claims, evidence, and freshness information.
+This is **freshness metadata visibility**, not automatic freshness tracking or automatic stale-document detection. The system does not compare `updated_at` against any age-based policy or flag documents as outdated on its own — it surfaces the timestamp so the user can judge relevance/recency themselves. Age-based freshness policies are listed under Future Improvements.
 
 ---
 
-## 6. Retrieval System
+## Example
 
-Retrieval and verification are distinct stages with different jobs:
-
-- **Retrieval:** *"Find potentially relevant evidence."*
-- **Verification:** *"Determine whether the evidence actually supports the requested answer."*
-
-The retrieval stage combines:
-- **Dense vector similarity** — question and chunks are embedded with `all-MiniLM-L6-v2`, and evidence is scored by embedding similarity.
-- **Lexical matching** — keyword/term overlap between the question and candidate chunks.
-- **Score combination** — the semantic and lexical scores are combined to rank candidates.
-
-
----
-
-## 7. Claim Extraction
-
-Rather than verifying a whole block of retrieved text against a question, the system extracts individual, checkable factual claims first. This makes verification more precise — a claim is either supported or it isn't, which is harder to determine reliably against a full paragraph.
-
-**Example:**
-
-- **Question:** "How many holidays are employees assigned?"
-- **Evidence:** "Employees are assigned only 25 holidays in this organization."
-- **Extracted claim:** "Employees are assigned 25 holidays."
-
-> **To confirm in `graph.py` / `verification.py`:** whether claim extraction is a distinct code step (e.g. rule-based sentence splitting/parsing) or is performed by prompting the Groq LLM. Document whichever is actually true — this materially affects how "Verification Engine" (below) should be described.
-
----
-
-## 8. Verification Engine
-
-The verification stage determines whether the extracted claim(s) actually answer the user's question, rather than simply being topically related to it. Based on the project architecture, this involves:
-
-- **Evidence/question alignment** — checking whether the claim's content actually addresses what the question is asking.
-- **Similarity/confidence scoring** — a numeric confidence score reflecting how well the evidence supports the claim.
-- **Conflict detection** — checking whether multiple retrieved pieces of evidence disagree with each other.
-- **Verification status** — the result is categorized (e.g. verified / unverified / needs review).
-
-> **To confirm and fill in from `verification.py`:**
-> - Is there explicit question-type detection (e.g. "how many", "who", "when")?
-> - Is question-term extraction rule-based (e.g. keyword/entity extraction) or LLM-based?
-> - What are the exact similarity/confidence thresholds used?
-> - Is contradiction detection implemented, and how (e.g. comparing claims from multiple chunks)?
-> - What are the literal status values returned (e.g. `"verified"`, `"unverified"`, `"needs_review"`)?
->
-> Please replace this note with the confirmed logic — this is the most important section for recruiters evaluating the project's technical depth, so it should be as precise as possible.
-
----
-
-## 9. Threshold Gating
-
-The system does not generate a confident-sounding answer when the supporting evidence is weak.
-
-```
-Strong supporting evidence
-    → passes verification
-    → Verified Answer
-
-Insufficient / unsupported evidence
-    → fails verification
-    → Safe Unverified Fallback
-```
-
-This does not make the system infallible — it only reduces the chance that a weakly-supported claim is presented with false confidence.
-
----
-
-## 10. Freshness Tracking
-
-Each stored chunk carries an `Freshness` timestamp derived from its source document, which is surfaced through the evidence results and shown in the UI.
-
-**Example:**
-
-- Knowledge: "Documents must be reviewed every 90 days."
-- Metadata: `Freshness: 2026-08-31T18:06:34`
-
-This lets a user see when the underlying source document was last updated, alongside the answer.
-
-> **Important accuracy note:** as currently described, the system *records and displays* `Freshness` — it does not automatically determine that information is "outdated" based on age. Only describe an automatic staleness/age-based policy here if that logic is actually implemented in code (e.g. in `chunking.py` or `graph.py`); otherwise keep the description limited to "displays freshness metadata."
-
----
-
-## 11. Real-World Example
-
-**Supported question:**
+**Supported question**
 
 Knowledge base contains:
 > "Employees are assigned only 25 holidays in this organization."
 
-User asks: *"How many holidays are assigned to employees?"*
+Question: *"How many holidays are employees assigned?"*
 
-```
-Question
-  → Retrieval (finds the holiday policy chunk)
-  → Claim extraction ("Employees are assigned 25 holidays.")
-  → Verification (claim aligns with question)
-  → Confidence: high
-  → Threshold: passed
-  → Verified Answer: "Employees are assigned 25 holidays."
-```
+The retrieved evidence contains the specific numeric fact the question asks for, so it can receive strong semantic and lexical support and satisfy the implemented verification checks, producing a verified result along with the supporting evidence
 
-**Unsupported question:**
+**Unsupported question**
 
-User asks: *"Who approves employee holidays?"*
+Question: *"Who approves employee holidays?"*
 
-If no chunk in the knowledge base addresses an approver, the system should not invent one:
-
-```
-Question
-  → Retrieval (no directly relevant evidence found)
-  → Claim extraction (no supporting claim)
-  → Verification: fails
-  → Threshold: not met
-  → Result: Unverified / Safe Fallback
-```
+If the indexed knowledge base contains no evidence describing an approver, retrieval may still return topically related evidence — but that evidence won't contain lexical or semantic support for "who approves." The support score falls short of the required thresholds, and the system marks the result as `unverified` rather than presenting unsupported information as verified.
 
 ---
 
-## 12. API
+## API
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `GET` | `/` | *(confirm in `main.py`: likely a basic liveness/root response)* |
-| `GET` | `/health` | Health check |
-| `POST` | `/ask` | Submit a question and receive a verified/unverified answer |
+### `GET /`
+Basic liveness/info endpoint.
+
+### `GET /health`
+Health check endpoint.
 
 ### `POST /ask`
 
-**Request:**
+Accepts a question and returns the generated answer together with verification information, evidence, confidence/support information, and warnings.
+
+The exact response schema is derived from how the frontend consumes it (`data.verification`, `data.verification.status`, `data.verification.claims`) and how the backend graph exposes results (`result.get("verification", {})`), which indicates verification information is returned as a nested object. The following is an **illustrative example**, not a confirmed literal schema:
 
 ```json
-{
-  "question": "How many holidays are employees assigned?"
-}
-```
-
-**Response (illustrative — confirm exact fields in `main.py` / `graph.py`):**
-
-```json
+// Illustrative example — not a confirmed literal API response
 {
   "question": "How many holidays are employees assigned?",
-  "answer": "Employees are assigned 25 holidays.",
+  "answer": "...",
   "verification": {
     "status": "verified",
-    "confidence": 0.91,
+    "confidence": 0.0,
     "warnings": [],
-    "claims": ["Employees are assigned 25 holidays."]
+    "claims": []
   },
-  "evidence": [
-    {
-      "text": "Employees are assigned only 25 holidays in this organization.",
-      "source": "hr_policy.txt",
-      "updated_at": "2026-08-31T18:06:34"
-    }
-  ]
+  "evidence": []
 }
 ```
-
-> Replace the sample response above with the literal field names and structure returned by the actual endpoint — this is one of the sections most likely to differ from the illustrative example given in the spec.
 
 ---
 
-## 13. Project Structure
+## Working Demo!!
+
+Screenshots below show the interface returning a question alongside its verification status, confidence, evidence with source and similarity information, and warnings when evidence is insufficient.
+
+<img width="1914" height="871" alt="Screenshot 2026-09-01 174022" src="https://github.com/user-attachments/assets/8c2e2679-0cae-45d3-b2df-88dc9b16f950" />
+
+<img width="1893" height="788" alt="Screenshot 2026-09-01 174743" src="https://github.com/user-attachments/assets/48dce257-2a3d-48b6-a643-4b38585737b3" />
+
+<img width="1888" height="884" alt="Screenshot 2026-09-01 174825" src="https://github.com/user-attachments/assets/43734959-564e-4153-9283-d9063e813116" />
+
+<img width="1896" height="863" alt="Screenshot 2026-09-01 174854" src="https://github.com/user-attachments/assets/f222caf2-c38c-43aa-8d76-5a04a0ed1fdd" />
+
+
+
+
+---
+
+## Project Structure
 
 ```
 Series3/
 ├── backend/
-│   └── app/
-│       ├── __init__.py
-│       ├── chunking.py         # Atomic document chunking
-│       ├── embeddings.py       # Embedding generation (all-MiniLM-L6-v2)
-│       ├── graph.py            # LangGraph workflow definition
-│       ├── indexer.py          # Indexing logic for Qdrant
-│       ├── ingestion.py        # Document ingestion pipeline
-│       ├── llm.py              # Groq LLM integration
-│       ├── main.py             # FastAPI app / endpoints
-│       ├── qdrant.py           # Qdrant client / vector DB integration
-│       ├── retriever.py        # Hybrid retrieval logic
-│       ├── setup_qdrant.py     # Qdrant collection setup
-│       ├── verification.py     # Claim verification engine
-│       └── test_*.py           # Unit tests for each module
-│   ├── index_documents.py      # Script to run ingestion
-│   ├── requirements.txt
-│   └── .env               
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── chunking.py        # Splits source documents into chunks
+│   │   ├── embeddings.py      # Local sentence-transformer embedding generation
+│   │   ├── graph.py           # LangGraph workflow definition
+│   │   ├── indexer.py         # Writes chunks + embeddings + metadata to Qdrant
+│   │   ├── ingestion.py       # Loads source documents
+│   │   ├── llm.py             # Groq API integration for answer formulation
+│   │   ├── main.py            # FastAPI app and routes (/, /health, /ask)
+│   │   ├── qdrant.py          # Qdrant client/config
+│   │   ├── retriever.py       # Semantic retrieval from Qdrant
+│   │   ├── setup_qdrant.py    # Qdrant collection setup
+│   │   ├── verification.py    # Core evidence-support verification logic
+│   │   └── test_*.py          # Tests, including test_graph.py
+│   ├── index_documents.py     # Ingestion entry point
+│   └── requirements.txt
 ├── data/
 │   └── documents/
 │       ├── rules.txt
@@ -348,119 +289,121 @@ Series3/
 └── frontend/
     ├── public/
     ├── src/
-    │   ├── App.jsx              # Main dashboard UI
+    │   ├── App.jsx             # Main UI: question input, answer, verification display
     │   ├── App.css
-    │   ├── main.jsx
-    │   └── index.css
+    │   ├── index.css
+    │   └── main.jsx
     ├── index.html
     ├── package.json
-    ├── vite.config.js
-    └── README.md
+    └── vite.config.js
 ```
 
 ---
 
-## 14. Installation
+## Frontend
 
-### Prerequisites
-- Python 3.10+
-- Node.js + npm
-- A running Qdrant instance (local via Docker, or Qdrant Cloud)
+The React/Vite frontend includes:
 
+- Project branding and example questions
+- A question input field and Ask button
+- The generated answer
+- Verification status and confidence
+- A verified claim **count** (not a full list of every extracted claim's text)
+- Evidence results with source, similarity, and freshness (`updated_at`) information
+- Warnings when evidence is insufficient
+- Responsive layout with subtle UI animations, using Lucide icons
 
-### Backend setup
+---
+
+## Engineering Decisions
+
+**Qdrant** — used for vector storage and retrieval; runs locally during development and stores embeddings alongside the metadata that retrieval and verification both depend on.
+
+**Local embeddings (`all-MiniLM-L6-v2`)** — a lightweight sentence-transformer model that avoids external API calls for embedding generation, keeping ingestion self-contained.
+
+**LangGraph** — used as the workflow orchestration layer for the multi-step pipeline (retrieval → evidence analysis → verification → response generation), rather than chaining these stages as ad hoc function calls.
+
+**FastAPI** — a minimal, fast backend framework exposing `/`, `/health`, and `/ask`.
+
+**React + Vite** — for a fast frontend development loop and a UI that can surface verification detail (status, confidence, evidence) without much overhead.
+
+**Groq** — used for LLM-based response formulation. The LLM is not the component that determines evidence support; the custom verification logic evaluates evidence support independently of the LLM's own confidence in its output.
+
+**Custom verification logic instead of relying on LLM confidence** — the core premise of the project is that an LLM producing fluent, confident-sounding text is not the same as evidence actually supporting the answer. Verification is implemented as a separate heuristic layer specifically to avoid conflating the two.
+
+---
+
+## Limitations
+
+- Verification is heuristic (semantic similarity + lexical overlap + thresholds + question-type filtering), not formal or guaranteed factual verification.
+- The support score is not a probability of factual correctness — it reflects heuristic evidence-support strength only.
+- The `_detect_conflicts()` function exists in `verification.py` but its current implementation returns `False` — **conflict/contradiction detection is not currently functionally implemented**; it is a stub.
+- Freshness is metadata visibility (`updated_at` displayed to the user), not automatic staleness detection based on document age.
+- Claim analysis is sentence-level splitting and filtering, not sophisticated LLM-based structured claim extraction.
+- No cross-encoder reranking, BM25, or advanced sparse-vector retrieval is implemented. Candidate evidence is retrieved using Qdrant vector similarity and subsequently evaluated by the verification layer using semantic similarity and lexical/question-term signals.
+- No source-authority modeling — all indexed sources are treated equally.
+- Evaluation has been done at prototype scale on a small document set, not against a labeled benchmark.
+- This is a prototype/engineering project, not a production enterprise system.
+- The underlying source documents themselves are not independently fact-checked by this system.
+
+---
+
+## Future Improvements
+
+- Robust contradiction/conflict detection (beyond the current stub)
+- Cross-encoder reranking of retrieved evidence
+- Source authority weighting
+- Age-based freshness/staleness policies
+- A labeled evaluation benchmark
+- Document version comparison
+- Scheduled/automated ingestion
+- Audit logging
+- Authentication and access control
+- Monitoring and observability
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React, Vite, CSS, Lucide icons |
+| Backend | Python, FastAPI |
+| Workflow orchestration | LangGraph |
+| Vector database | Qdrant |
+| Embeddings | sentence-transformers / Hugging Face (`all-MiniLM-L6-v2`) |
+| LLM | Groq API |
+
+---
+
+## Setup
+
+### Backend
 
 ```bash
 cd backend
 python -m venv venv
-source venv/bin/activate    # Windows: venv\Scripts\activate
+
+# Windows
+venv\Scripts\activate
+
 pip install -r requirements.txt
-```
 
-
-
-
-
-Index the source documents into Qdrant:
-
-```bash
+# Index documents into Qdrant
 python index_documents.py
-```
 
-Start the backend:
-
-```bash
+# Start the API
 uvicorn app.main:app --reload
 ```
 
-### Frontend setup
+Qdrant must be running and reachable before indexing or querying.
+
+### Frontend
 
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-
-
----
-
-## 15. Example UI
-
-The React dashboard is built around a single question/answer flow and displays:
-
-- The submitted question and generated answer
-- A verification status indicator
-- The confidence score
-- The extracted claim(s)
-- The retrieved evidence, including source and freshness (`updated_at`) timestamp
-- Any warnings surfaced by the verification stage
-
----
-
-## 16. Key Engineering Decisions
-
-- **Qdrant** — chosen as a purpose-built vector database for storing and querying chunk embeddings efficiently.
-- **Local embeddings (`Huggingface embedding`)** — avoids sending internal document text to an external embedding API and keeps embedding generation fast and self-hosted.
-- **Hybrid retrieval** — combining semantic and lexical signals helps catch relevant evidence that pure vector similarity alone might miss (e.g. exact terms/numbers).
-- **Atomic chunking** — small, self-contained chunks make it easier for the verification stage to check one discrete fact at a time, rather than reasoning over a large block of mixed content.
-- **LangChain** — chosen as the underlying framework for standardizing prompt management, chain structures, and document handling across the retrieval and verification pipeline.
-- **LangGraph** — used to structure the multi-step query pipeline (retrieval → claim extraction → verification → gating) as an explicit, inspectable workflow rather than a single opaque LLM call.
-- **Verification before answer generation** — the core design choice of the project: don't let the LLM answer freely, check the evidence against the question first.
-- **Freshness metadata** — gives users visibility into how current the underlying source document is, rather than treating all knowledge as equally current.
-
----
-
----
-
-## 17. Future Improvements
-
-
-- Cross-encoder reranking for higher-precision retrieval
-- Age-based / policy-driven freshness rules (e.g. flagging documents older than N days)
-- Source authority weighting (trusting some documents more than others)
-- More robust contradiction detection across multiple evidence sources
-- A labeled evaluation benchmark for retrieval/verification accuracy
-- Automated, scheduled document ingestion
-- Document version comparison / change tracking
-- Audit logging of questions, answers, and verification outcomes
-- Production-grade authentication and access control
-- Monitoring and observability for the pipeline
-
----
-
-
----
-
-
-
-## 18. Technologies
-
-| Layer | Technology |
-|---|---|
-| Frontend | React, Vite, CSS |
-| Backend | Python, FastAPI,Langchain, LangGraph |
-| Vector DB | Qdrant |
-| Embeddings | Hugging Face `sentence-transformers` |
-| LLM | Groq API |
 
 ---
