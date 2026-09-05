@@ -369,6 +369,7 @@ The React/Vite frontend includes:
 |---|---|
 | Frontend | React, Vite, CSS, Lucide icons |
 | Backend | Python, FastAPI |
+| Document processing | LangChain (PyPDFLoader, Document) |
 | Workflow orchestration | LangGraph |
 | Vector database | Qdrant |
 | Embeddings | sentence-transformers / Hugging Face (`all-MiniLM-L6-v2`) |
